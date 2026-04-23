@@ -5,7 +5,10 @@ import os
 import time
 import threading
 import logging
-import pygame  # NEW: Import pygame for audio
+import pygame
+import sounddevice as sd
+from scipy.io.wavfile import write
+from pydub import AudioSegment
 from picamera2 import Picamera2
 from gpiozero import Button
 
@@ -21,7 +24,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# NEW: Initialize pygame mixer and define blocking playback function
 pygame.mixer.init()
 
 def play_audio_blocking(filename):
@@ -30,14 +32,12 @@ def play_audio_blocking(filename):
         try:
             pygame.mixer.music.load(filename)
             pygame.mixer.music.play()
-            # This while loop is what forces the code to wait
             while pygame.mixer.music.get_busy():
                 pygame.time.Clock().tick(10)
         except Exception as e:
-            logger.error(f"Audio playback error for {filename}: {e}")
+            logger.error(f"Audio playback error: {e}")
     else:
         logger.warning(f"Audio file not found: {filename}")
-
 
 # --- 1. Threaded Thermal Camera ---
 class ThreadedThermalCamera:
@@ -100,14 +100,75 @@ def get_next_scene_num():
 
 scene_num = get_next_scene_num()
 trigger_capture_flag = False
+is_recording_busy = False # Safety flag to prevent overlapping recordings
 running_flag = True
 clicked_point, measure_text = None, ""
 global_depth_map, global_raw_warped = None, None
 
-# --- 3. Hardware Button ---
+# --- 3. Audio Recording Settings (USB Adapter) ---
+DEVICE_ID = 1    # AB13X USB Audio
+FREQ = 48000     
+SECONDS = 5
+
+def record_audio_task(scene_folder):
+    """Background task to record audio and convert to MP3."""
+    global is_recording_busy
+    is_recording_busy = True
+    filename = os.path.join(scene_folder, "voice_note.mp3")
+    temp_wav = f"temp_{int(time.time())}.wav"
+    
+    try:
+        logger.info(f"Recording audio to {filename}...")
+        play_audio_blocking("recording_started.mp3")
+        
+        # Capture from USB
+        recording = sd.rec(int(SECONDS * FREQ), samplerate=FREQ, channels=2, device=DEVICE_ID)
+        sd.wait()
+        
+        # Export as MP3
+        write(temp_wav, FREQ, recording)
+        audio = AudioSegment.from_wav(temp_wav)
+        audio.export(filename, format="mp3", bitrate="192k")
+        
+        if os.path.exists(temp_wav):
+            os.remove(temp_wav)
+            
+        logger.info("Audio capture complete.")
+        play_audio_blocking("images_saved.mp3")
+    except Exception as e:
+        logger.error(f"Audio Task Error: {e}")
+    finally:
+        is_recording_busy = False
+
+def save_scene_worker(s_num, l_img, r_img, d_gray, d_raw, t_warp, t_raw, r_viz):
+    """Saves all visual data and then triggers the audio recording."""
+    base = os.path.join(ROOT_IMG_DIR, f"Scene_{s_num}")
+    for s in ["left_cam", "right_cam", "depth", "thermal", "annotated"]:
+        os.makedirs(os.path.join(base, s), exist_ok=True)
+    
+    # Save Images
+    cv2.imwrite(os.path.join(base, "left_cam/left.png"), l_img)
+    cv2.imwrite(os.path.join(base, "right_cam/right.png"), r_img)
+    cv2.imwrite(os.path.join(base, "depth/depth.png"), d_gray)
+    np.save(os.path.join(base, "depth/depth.npy"), d_raw)
+    cv2.imwrite(os.path.join(base, "thermal/thermal.png"), t_warp)
+    if t_raw is not None:
+        np.save(os.path.join(base, "thermal/thermal.npy"), (t_raw / 100.0) - 273.15)
+    cv2.imwrite(os.path.join(base, "annotated/annotated.png"), r_viz)
+    
+    with open(os.path.join(base, "metadata.json"), "w") as f:
+        json.dump({"Q": Q.tolist(), "scene": s_num, "timestamp": time.time()}, f, indent=4)
+    
+    logger.info(f"Visual data for Scene {s_num} saved. Starting audio recording...")
+    record_audio_task(base)
+
+# --- 4. Hardware Button ---
 def request_capture():
     global trigger_capture_flag
-    trigger_capture_flag = True
+    if not is_recording_busy:
+        trigger_capture_flag = True
+    else:
+        logger.warning("Still recording previous scene. Please wait.")
 
 def request_shutdown():
     global running_flag
@@ -120,7 +181,7 @@ try:
 except Exception as e:
     logger.error(f"GPIO Error: {e}")
 
-# --- 4. Mouse Callback ---
+# --- 5. Mouse Callback ---
 def on_mouse_click(event, x, y, flags, param):
     global clicked_point, measure_text, global_depth_map, global_raw_warped
     if event == cv2.EVENT_LBUTTONDOWN and x < DASH_W and y < DASH_H:
@@ -136,7 +197,7 @@ def on_mouse_click(event, x, y, flags, param):
             t_str = f"{(global_raw_warped[orig_y, orig_x] / 100.0) - 273.15:.1f}C"
         measure_text = f"{d_str} | {t_str}"
 
-# --- 5. Initialization ---
+# --- 6. Initialization ---
 picam0, picam1 = Picamera2(1), Picamera2(0)
 for p in [picam0, picam1]:
     p.configure(p.create_preview_configuration(main={"size": (W, H)}))
@@ -146,8 +207,6 @@ thermal_camera_path = '/dev/v4l/by-id/usb-GroupGets_PureThermal__fw:v1.3.0__001b
 thermal_cam = ThreadedThermalCamera(thermal_camera_path).start()
 
 time.sleep(1.0)
-
-# NEW: Play audio when cameras are successfully started
 play_audio_blocking("camera_started.mp3")
 
 matcher_left = cv2.StereoSGBM_create(minDisparity=0, numDisparities=96, blockSize=11)
@@ -164,15 +223,12 @@ cv2.namedWindow("Glasses Dashboard")
 cv2.setMouseCallback("Glasses Dashboard", on_mouse_click)
 cv2.namedWindow("Fine Tune")
 def nothing(x): pass
-cv2.createTrackbar("ROI X", "Fine Tune", 143, W, nothing)
-cv2.createTrackbar("ROI Y", "Fine Tune", 18, H, nothing)
-cv2.createTrackbar("ROI W", "Fine Tune", 473, W, nothing)
-cv2.createTrackbar("ROI H", "Fine Tune", 583, H, nothing)
+cv2.createTrackbar("ROI X", "Fine Tune", 143, W, nothing); cv2.createTrackbar("ROI Y", "Fine Tune", 18, H, nothing)
+cv2.createTrackbar("ROI W", "Fine Tune", 473, W, nothing); cv2.createTrackbar("ROI H", "Fine Tune", 583, H, nothing)
 cv2.createTrackbar("Parallax", "Fine Tune", 100, 200, nothing)
-cv2.createTrackbar("Hot Thresh", "Fine Tune", 190, 255, nothing)
-cv2.createTrackbar("Cold Thresh", "Fine Tune", 80, 255, nothing)
+cv2.createTrackbar("Hot Thresh", "Fine Tune", 190, 255, nothing); cv2.createTrackbar("Cold Thresh", "Fine Tune", 80, 255, nothing)
 
-# --- 6. Main Loop ---
+# --- 7. Main Loop ---
 try:
     while running_flag:
         rectL = cv2.remap(cv2.cvtColor(picam0.capture_array()[:,:,:3], cv2.COLOR_RGB2BGR), mapL1, mapL2, cv2.INTER_LINEAR)
@@ -234,45 +290,33 @@ try:
             cv2.circle(rgb_viz, clicked_point, 5, (0,255,0), -1)
             cv2.putText(rgb_viz, measure_text, (20,40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
 
-        # Dashboard Prep
         gray_d = cv2.normalize(depth_map, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
         color_d = cv2.applyColorMap(gray_d, cv2.COLORMAP_JET)
         t1, t2, t3 = cv2.resize(rgb_viz, (DASH_W, DASH_H)), cv2.resize(rectR, (DASH_W, DASH_H)), cv2.resize(cv2.cvtColor(gray_d, cv2.COLOR_GRAY2BGR), (DASH_W, DASH_H))
         t4, t5, t6 = cv2.resize(color_d, (DASH_W, DASH_H)), cv2.resize(thermal_warped, (DASH_W, DASH_H)), cv2.resize(th_vis_full, (DASH_W, DASH_H))
         cv2.imshow("Glasses Dashboard", np.vstack((np.hstack((t1, t2, t3)), np.hstack((t4, t5, t6)))))
 
-        # --- TRIGGER CAPTURE LOGIC (SPECIFIC FOLDERS) ---
+        # --- BACKGROUND CAPTURE TRIGGER ---
         if trigger_capture_flag:
-            # NEW: Play audio to acknowledge button press *before* saving code runs
             play_audio_blocking("captured.mp3")
             
-            base = os.path.join(ROOT_IMG_DIR, f"Scene_{scene_num}")
-            subfolders = ["left_cam", "right_cam", "depth", "thermal", "annotated"]
-            for s in subfolders: os.makedirs(os.path.join(base, s), exist_ok=True)
+            # Snap copies of everything so the thread works with the current frame
+            t_raw_snap = global_raw_warped.copy() if global_raw_warped is not None else None
             
-            cv2.imwrite(os.path.join(base, "left_cam/left.png"), rectL)
-            cv2.imwrite(os.path.join(base, "right_cam/right.png"), rectR)
-            cv2.imwrite(os.path.join(base, "depth/depth.png"), gray_d)
-            np.save(os.path.join(base, "depth/depth.npy"), depth_map)
-            print(depth_map.dtype)
-            cv2.imwrite(os.path.join(base, "thermal/thermal.png"), thermal_warped)
-            if global_raw_warped is not None:
-                np.save(os.path.join(base, "thermal/thermal.npy"), (global_raw_warped / 100.0) - 273.15)
-                
-            cv2.imwrite(os.path.join(base, "annotated/annotated.png"), rgb_viz)
+            args = (
+                scene_num, rectL.copy(), rectR.copy(), gray_d.copy(), 
+                depth_map.copy(), thermal_warped.copy(), t_raw_snap, rgb_viz.copy()
+            )
             
-            with open(os.path.join(base, "metadata.json"), "w") as f:
-                json.dump({"Q": Q.tolist(), "scene": scene_num, "timestamp": time.time()}, f, indent=4)
+            # Start background thread
+            threading.Thread(target=save_scene_worker, args=args).start()
             
-            logger.info(f"Captured Scene {scene_num}"); scene_num += 1
+            scene_num += 1
             trigger_capture_flag = False
-
-            # NEW: Play audio once the I/O saving operations are complete
-            play_audio_blocking("images_saved.mp3")
 
         if cv2.waitKey(1) & 0xFF == ord('q'): break
 
 finally:
     play_audio_blocking("script_stopped.mp3")
     picam0.stop(); picam1.stop(); thermal_cam.stop(); cv2.destroyAllWindows()
-    pygame.mixer.quit() # NEW: Clean up the audio mixer
+    pygame.mixer.quit()

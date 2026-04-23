@@ -5,41 +5,48 @@ import os
 import time
 import threading
 import logging
-import pygame  # NEW: Import pygame for audio
+import pygame 
 from picamera2 import Picamera2
 from gpiozero import Button
 
-# --- 0. Logging & Audio Setup ---
-os.makedirs("logs", exist_ok=True)
+# --- 0. Absolute Path Configuration & Headless Toggle ---
+BASE_PATH = "/home/bghimir1/Desktop/Smart-Helmet"
+LOG_DIR = os.path.join(BASE_PATH, "logs")
+ROOT_IMG_DIR = os.path.join(BASE_PATH, "Dataset")
+CALIB_FILE = os.path.join(BASE_PATH, "stereo_calibration_0303_v2.json")
+
+HEADLESS_MODE = True  # Set to False only when testing with a monitor attached
+
+# --- 1. Logging & Audio Setup ---
+os.makedirs(LOG_DIR, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[
-        logging.FileHandler(f"logs/session_{time.strftime('%Y%m%d_%H%M%S')}.log"),
+        logging.FileHandler(os.path.join(LOG_DIR, f"session_{time.strftime('%Y%m%d_%H%M%S')}.log")),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
 
-# NEW: Initialize pygame mixer and define blocking playback function
 pygame.mixer.init()
 
 def play_audio_blocking(filename):
-    """Plays an audio file and blocks execution until it finishes."""
-    if os.path.exists(filename):
+    """Plays an audio file using an absolute path and blocks execution until it finishes."""
+    abs_audio_path = os.path.join(BASE_PATH, filename)
+    if os.path.exists(abs_audio_path):
         try:
-            pygame.mixer.music.load(filename)
+            pygame.mixer.music.load(abs_audio_path)
             pygame.mixer.music.play()
-            # This while loop is what forces the code to wait
             while pygame.mixer.music.get_busy():
                 pygame.time.Clock().tick(10)
         except Exception as e:
-            logger.error(f"Audio playback error for {filename}: {e}")
+            logger.error(f"Audio playback error for {abs_audio_path}: {e}")
     else:
-        logger.warning(f"Audio file not found: {filename}")
+        logger.warning(f"Audio file not found: {abs_audio_path}")
 
 
-# --- 1. Threaded Thermal Camera ---
+# --- 2. Threaded Thermal Camera ---
 class ThreadedThermalCamera:
     def __init__(self, src=16):
         self.capture = cv2.VideoCapture(src, cv2.CAP_V4L2)
@@ -76,8 +83,7 @@ class ThreadedThermalCamera:
         self.stopped = True
         self.capture.release()
 
-# --- 2. Calibration & Globals ---
-CALIB_FILE = "stereo_calibration_0303_v2.json"
+# --- 3. Calibration & Globals ---
 try:
     with open(CALIB_FILE, "r") as f:
         calib = json.load(f)
@@ -90,7 +96,6 @@ mtx1, dist1 = np.array(calib["cam1"]["camera_matrix"]), np.array(calib["cam1"]["
 
 W, H = 800, 800
 DASH_W, DASH_H = 320, 320
-ROOT_IMG_DIR = "Dataset"
 os.makedirs(ROOT_IMG_DIR, exist_ok=True)
 
 def get_next_scene_num():
@@ -104,7 +109,7 @@ running_flag = True
 clicked_point, measure_text = None, ""
 global_depth_map, global_raw_warped = None, None
 
-# --- 3. Hardware Button ---
+# --- 4. Hardware Button ---
 def request_capture():
     global trigger_capture_flag
     trigger_capture_flag = True
@@ -120,7 +125,7 @@ try:
 except Exception as e:
     logger.error(f"GPIO Error: {e}")
 
-# --- 4. Mouse Callback ---
+# --- 5. Mouse Callback ---
 def on_mouse_click(event, x, y, flags, param):
     global clicked_point, measure_text, global_depth_map, global_raw_warped
     if event == cv2.EVENT_LBUTTONDOWN and x < DASH_W and y < DASH_H:
@@ -136,7 +141,7 @@ def on_mouse_click(event, x, y, flags, param):
             t_str = f"{(global_raw_warped[orig_y, orig_x] / 100.0) - 273.15:.1f}C"
         measure_text = f"{d_str} | {t_str}"
 
-# --- 5. Initialization ---
+# --- 6. Initialization ---
 picam0, picam1 = Picamera2(1), Picamera2(0)
 for p in [picam0, picam1]:
     p.configure(p.create_preview_configuration(main={"size": (W, H)}))
@@ -147,7 +152,6 @@ thermal_cam = ThreadedThermalCamera(thermal_camera_path).start()
 
 time.sleep(1.0)
 
-# NEW: Play audio when cameras are successfully started
 play_audio_blocking("camera_started.mp3")
 
 matcher_left = cv2.StereoSGBM_create(minDisparity=0, numDisparities=96, blockSize=11)
@@ -160,19 +164,20 @@ mapR1, mapR2 = cv2.initUndistortRectifyMap(mtx1, dist1, R2, P2, (W, H), cv2.CV_3
 grid_x, grid_y = np.meshgrid(np.arange(W), np.arange(H))
 grid_x, grid_y = grid_x.astype(np.float32), grid_y.astype(np.float32)
 
-cv2.namedWindow("Glasses Dashboard")
-cv2.setMouseCallback("Glasses Dashboard", on_mouse_click)
-cv2.namedWindow("Fine Tune")
-def nothing(x): pass
-cv2.createTrackbar("ROI X", "Fine Tune", 143, W, nothing)
-cv2.createTrackbar("ROI Y", "Fine Tune", 18, H, nothing)
-cv2.createTrackbar("ROI W", "Fine Tune", 473, W, nothing)
-cv2.createTrackbar("ROI H", "Fine Tune", 583, H, nothing)
-cv2.createTrackbar("Parallax", "Fine Tune", 100, 200, nothing)
-cv2.createTrackbar("Hot Thresh", "Fine Tune", 190, 255, nothing)
-cv2.createTrackbar("Cold Thresh", "Fine Tune", 80, 255, nothing)
+if not HEADLESS_MODE:
+    cv2.namedWindow("Glasses Dashboard")
+    cv2.setMouseCallback("Glasses Dashboard", on_mouse_click)
+    cv2.namedWindow("Fine Tune")
+    def nothing(x): pass
+    cv2.createTrackbar("ROI X", "Fine Tune", 143, W, nothing)
+    cv2.createTrackbar("ROI Y", "Fine Tune", 18, H, nothing)
+    cv2.createTrackbar("ROI W", "Fine Tune", 473, W, nothing)
+    cv2.createTrackbar("ROI H", "Fine Tune", 583, H, nothing)
+    cv2.createTrackbar("Parallax", "Fine Tune", 100, 200, nothing)
+    cv2.createTrackbar("Hot Thresh", "Fine Tune", 190, 255, nothing)
+    cv2.createTrackbar("Cold Thresh", "Fine Tune", 80, 255, nothing)
 
-# --- 6. Main Loop ---
+# --- 7. Main Loop ---
 try:
     while running_flag:
         rectL = cv2.remap(cv2.cvtColor(picam0.capture_array()[:,:,:3], cv2.COLOR_RGB2BGR), mapL1, mapL2, cv2.INTER_LINEAR)
@@ -195,10 +200,19 @@ try:
             th_vis_full = cv2.rotate(cv2.resize(cv2.applyColorMap(th_norm, cv2.COLORMAP_INFERNO), (W, H)), cv2.ROTATE_180)
             th_vis_gray = cv2.rotate(cv2.resize(th_norm, (W, H)), cv2.ROTATE_180)
             
-            rx, ry = cv2.getTrackbarPos("ROI X", "Fine Tune"), cv2.getTrackbarPos("ROI Y", "Fine Tune")
-            rw, rh = cv2.getTrackbarPos("ROI W", "Fine Tune"), cv2.getTrackbarPos("ROI H", "Fine Tune")
-            px = (cv2.getTrackbarPos("Parallax", "Fine Tune") - 100) * 5.0
-            
+            if not HEADLESS_MODE:
+                rx = cv2.getTrackbarPos("ROI X", "Fine Tune")
+                ry = cv2.getTrackbarPos("ROI Y", "Fine Tune")
+                rw = cv2.getTrackbarPos("ROI W", "Fine Tune")
+                rh = cv2.getTrackbarPos("ROI H", "Fine Tune")
+                px = (cv2.getTrackbarPos("Parallax", "Fine Tune") - 100) * 5.0
+                hot_thresh = cv2.getTrackbarPos("Hot Thresh", "Fine Tune")
+                cold_thresh = cv2.getTrackbarPos("Cold Thresh", "Fine Tune")
+            else:
+                rx, ry, rw, rh = 143, 18, 473, 583
+                px = 0.0
+                hot_thresh, cold_thresh = 190, 80
+
             crop_vis = th_vis_full[ry:ry+rh, rx:rx+rw]
             crop_gray = th_vis_gray[ry:ry+rh, rx:rx+rw]
             crop_raw = cv2.rotate(cv2.resize(th_f, (W, H)), cv2.ROTATE_180)[ry:ry+rh, rx:rx+rw]
@@ -210,8 +224,8 @@ try:
                 g_warped = cv2.remap(g_f, shift_x, grid_y, cv2.INTER_LINEAR)
                 global_raw_warped = cv2.remap(r_f, shift_x, grid_y, cv2.INTER_NEAREST)
 
-                for (name, thr, meth, col) in [("HOT", cv2.getTrackbarPos("Hot Thresh", "Fine Tune"), cv2.THRESH_BINARY, (0,0,255)), 
-                                               ("COLD", cv2.getTrackbarPos("Cold Thresh", "Fine Tune"), cv2.THRESH_BINARY_INV, (255,0,0))]:
+                for (name, thr, meth, col) in [("HOT", hot_thresh, cv2.THRESH_BINARY, (0,0,255)), 
+                                               ("COLD", cold_thresh, cv2.THRESH_BINARY_INV, (255,0,0))]:
                     _, b_mask = cv2.threshold(g_warped, thr, 255, meth)
                     cnts, _ = cv2.findContours(b_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                     for c in cnts:
@@ -235,15 +249,21 @@ try:
             cv2.putText(rgb_viz, measure_text, (20,40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
 
         # Dashboard Prep
-        gray_d = cv2.normalize(depth_map, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
-        color_d = cv2.applyColorMap(gray_d, cv2.COLORMAP_JET)
-        t1, t2, t3 = cv2.resize(rgb_viz, (DASH_W, DASH_H)), cv2.resize(rectR, (DASH_W, DASH_H)), cv2.resize(cv2.cvtColor(gray_d, cv2.COLOR_GRAY2BGR), (DASH_W, DASH_H))
-        t4, t5, t6 = cv2.resize(color_d, (DASH_W, DASH_H)), cv2.resize(thermal_warped, (DASH_W, DASH_H)), cv2.resize(th_vis_full, (DASH_W, DASH_H))
-        cv2.imshow("Glasses Dashboard", np.vstack((np.hstack((t1, t2, t3)), np.hstack((t4, t5, t6)))))
+        if not HEADLESS_MODE:
+            gray_d = cv2.normalize(depth_map, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
+            color_d = cv2.applyColorMap(gray_d, cv2.COLORMAP_JET)
+            t1, t2, t3 = cv2.resize(rgb_viz, (DASH_W, DASH_H)), cv2.resize(rectR, (DASH_W, DASH_H)), cv2.resize(cv2.cvtColor(gray_d, cv2.COLOR_GRAY2BGR), (DASH_W, DASH_H))
+            t4, t5, t6 = cv2.resize(color_d, (DASH_W, DASH_H)), cv2.resize(thermal_warped, (DASH_W, DASH_H)), cv2.resize(th_vis_full, (DASH_W, DASH_H))
+            cv2.imshow("Glasses Dashboard", np.vstack((np.hstack((t1, t2, t3)), np.hstack((t4, t5, t6)))))
+            
+            if cv2.waitKey(1) & 0xFF == ord('q'): 
+                break
+        else:
+            # Yield to system to prevent 100% CPU lockup in headless mode
+            time.sleep(0.01)
 
         # --- TRIGGER CAPTURE LOGIC (SPECIFIC FOLDERS) ---
         if trigger_capture_flag:
-            # NEW: Play audio to acknowledge button press *before* saving code runs
             play_audio_blocking("captured.mp3")
             
             base = os.path.join(ROOT_IMG_DIR, f"Scene_{scene_num}")
@@ -252,13 +272,15 @@ try:
             
             cv2.imwrite(os.path.join(base, "left_cam/left.png"), rectL)
             cv2.imwrite(os.path.join(base, "right_cam/right.png"), rectR)
+            
+            gray_d = cv2.normalize(depth_map, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
             cv2.imwrite(os.path.join(base, "depth/depth.png"), gray_d)
             np.save(os.path.join(base, "depth/depth.npy"), depth_map)
-            print(depth_map.dtype)
             cv2.imwrite(os.path.join(base, "thermal/thermal.png"), thermal_warped)
+            
             if global_raw_warped is not None:
                 np.save(os.path.join(base, "thermal/thermal.npy"), (global_raw_warped / 100.0) - 273.15)
-                
+            
             cv2.imwrite(os.path.join(base, "annotated/annotated.png"), rgb_viz)
             
             with open(os.path.join(base, "metadata.json"), "w") as f:
@@ -267,12 +289,13 @@ try:
             logger.info(f"Captured Scene {scene_num}"); scene_num += 1
             trigger_capture_flag = False
 
-            # NEW: Play audio once the I/O saving operations are complete
             play_audio_blocking("images_saved.mp3")
-
-        if cv2.waitKey(1) & 0xFF == ord('q'): break
 
 finally:
     play_audio_blocking("script_stopped.mp3")
-    picam0.stop(); picam1.stop(); thermal_cam.stop(); cv2.destroyAllWindows()
-    pygame.mixer.quit() # NEW: Clean up the audio mixer
+    picam0.stop()
+    picam1.stop()
+    thermal_cam.stop()
+    if not HEADLESS_MODE:
+        cv2.destroyAllWindows()
+    pygame.mixer.quit()
